@@ -1,0 +1,10 @@
+#!/bin/zsh
+project_dir="${0:A:h:h:h:h}"
+exec /usr/bin/osascript - "$project_dir/Start Assistant.command" <<'APPLESCRIPT'
+on run argv
+    tell application "Terminal"
+        activate
+        do script (quoted form of (item 1 of argv))
+    end tell
+end run
+APPLESCRIPT

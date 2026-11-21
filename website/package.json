@@ -1,0 +1,1 @@
+{"name":"jessy-web","version":"1.0.0","private":true,"type":"module","scripts":{"build":"node build.mjs","test":"node --test test/*.test.mjs"},"dependencies":{"@mlc-ai/web-llm":"0.2.83","drizzle-orm":"^0.44.7","pdfjs-dist":"5.4.449"},"devDependencies":{"drizzle-kit":"^0.31.8","esbuild":"0.25.12"}}

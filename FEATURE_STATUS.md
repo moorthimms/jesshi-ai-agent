@@ -11,6 +11,11 @@
 | Routines | Reviewed prompt shortcuts | Reviewed prompt shortcuts | Reviewed prompt shortcuts + URL links |
 | Scheduled reminders | OS notifications | While app open | OS notifications |
 | Apple Calendar/Reminders | Explicit create actions | Not available | Explicit create actions |
+| Calendar briefing | Today / next 7 days with Apple Calendar permission | Not available | Today / next 7 days with Apple Calendar permission |
+| Inbox briefing | Unread sender and subject through Apple Mail | Not available | Not available |
+| Cloud voice | ElevenLabs playback for selected replies | Not available | Not available |
+| Two-model planning | Optional local planner before local replies | Not available | Not available |
+| Screen navigation | Local model proposes one accessible control for approval | Not available | Not available |
 | Action preview/permissions | Tool switches + approval | No device actions | Approval + OS permission gates |
 | Emergency stop | Kills local engine, stops voice | Interrupts generation/voice | Cancels generation/recording/voice |
 | Undo | Last volume/note tool + library changes | Last data edit | Last data edit |
@@ -54,3 +59,16 @@ gender, preview, speed, and an optional child-like pitch effect. Tamil can be
 pinned as the listening language for Record and hands-free input, avoiding
 automatic language switching. The small multilingual speech model replaces base.
 These improvements do not establish accuracy for every dialect or microphone.
+
+On Mac, **Library & Settings → Briefing** reads Apple Calendar on request. On
+iPhone, the same view is in **Tasks → Calendar briefing**. Full calendar access
+is required to read events. Briefing entries stay in the view and are not added
+to chat history or backups. Mac users can also paste a copied screenshot in the
+library to run local OCR and select its extracted text for chat.
+
+Mac **Library & Settings → Inbox** reads unread message subjects and senders
+from Apple Mail after macOS Automation permission. Connect Gmail or Outlook
+inside Apple Mail. **Screen** uses macOS Accessibility permission to identify
+a control in the selected app and asks before pressing it. **Model & Offline**
+can enable planning with another installed model. **Voice & Tamil** accepts
+an ElevenLabs voice ID and session key for individual reply playback.

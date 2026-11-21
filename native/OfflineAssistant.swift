@@ -7,6 +7,7 @@ import LocalAuthentication
 import UniformTypeIdentifiers
 import ServiceManagement
 import NaturalLanguage
+import ApplicationServices
 
 struct ChatLine: Identifiable, Codable {
     var id = UUID()
@@ -14,10 +15,128 @@ struct ChatLine: Identifiable, Codable {
     let text: String
 }
 
-final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeechSynthesizerDelegate {
+struct MailBriefingView: View {
+    @State private var unread: [String] = []
+    @State private var status = ""
+    @State private var loading = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Inbox briefing").font(.headline)
+                Text("Read unread subjects and senders from the first 30 messages in Apple Mail’s inbox. Add your Gmail or Outlook account in Apple Mail first.")
+                Button("Read Apple Mail inbox", systemImage: "envelope") { loadInbox() }
+                    .disabled(loading)
+                if loading { ProgressView("Reading Apple Mail…") }
+                if !status.isEmpty { Text(status).foregroundStyle(.secondary) }
+                ForEach(Array(unread.enumerated()), id: \.offset) { _, item in
+                    Text(item).textSelection(.enabled)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+        }
+    }
+
+    private func loadInbox() {
+        loading = true
+        unread = []
+        status = ""
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", """
+                with timeout of 20 seconds
+                    tell application "/System/Applications/Mail.app"
+                        set messageCount to count of messages of inbox
+                        if messageCount > 30 then set messageCount to 30
+                        set briefing to ""
+                        repeat with idx from 1 to messageCount
+                            set itemRef to message idx of inbox
+                            if read status of itemRef is false then
+                                set briefing to briefing & (sender of itemRef as text) & " — " & (subject of itemRef as text) & linefeed
+                            end if
+                        end repeat
+                        return briefing
+                    end tell
+                end timeout
+                """]
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let lines = String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline).map(String.init)
+                DispatchQueue.main.async {
+                    loading = false
+                    guard process.terminationStatus == 0 else {
+                        status = "Could not read Apple Mail. Check Mail setup and macOS Privacy & Security → Automation."
+                        return
+                    }
+                    unread = lines
+                    if lines.isEmpty { status = "No unread messages in the scanned inbox messages." }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    loading = false
+                    status = "Could not start the Apple Mail briefing."
+                }
+            }
+        }
+    }
+}
+
+struct ScreenNavigationView: View {
+    @ObservedObject var agent: Agent
+    @State private var appPID: pid_t = 0
+    @State private var goal = ""
+    @State private var applications: [NSRunningApplication] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Screen navigation").font(.headline)
+            Text("Choose an open app and describe one action. Jesshi uses the visible window’s accessibility labels to identify a control for you to review.")
+            Picker("App", selection: $appPID) {
+                Text("Select an app").tag(pid_t(0))
+                ForEach(applications, id: \.processIdentifier) { app in
+                    Text(app.localizedName ?? "App").tag(app.processIdentifier)
+                }
+            }
+            Button("Refresh app list") { refresh() }
+            TextField("Action, such as Show Downloads", text: $goal)
+            Button("Find control", systemImage: "cursorarrow.click") {
+                agent.findScreenControl(pid: appPID, goal: goal.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            .disabled(!agent.ready || agent.busy || appPID == 0 || goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Text(agent.status).font(.caption).foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding()
+        .onAppear { refresh() }
+    }
+
+    private func refresh() {
+        applications = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        }.sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+        if !applications.contains(where: { $0.processIdentifier == appPID }) { appPID = 0 }
+    }
+}
+
+final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
     @Published var lines: [ChatLine] = []
     @Published var liveReply = ""
     @Published var latency = ""
+    @Published var cloudVoiceID = UserDefaults.standard.string(forKey: "jessy.cloudVoiceID") ?? "" {
+        didSet { UserDefaults.standard.set(cloudVoiceID, forKey: "jessy.cloudVoiceID") }
+    }
+    @Published var cloudVoiceKey = ""
+    @Published private(set) var cloudVoiceActive = false
+    private var cloudVoiceTask: Task<Void, Never>?
+    private var cloudPlayer: AVAudioPlayer?
+    private var pendingNavigation: (app: NSRunningApplication, window: AXUIElement, controls: [(AXUIElement, String)])?
     @Published var sessionAvailable = true
     let voice = VoiceController()
     @Published var voiceID = UserDefaults.standard.string(forKey: "jessy.voiceID") ?? "auto" { didSet { UserDefaults.standard.set(voiceID, forKey: "jessy.voiceID") } }
@@ -33,7 +152,7 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
         utterance.rate = Float(voiceRate)
     }
     func previewVoice() {
-        guard !busy else { return }
+        guard !busy, !cloudVoiceActive else { return }
         speaker.stopSpeaking(at: .immediate); voice.suspend()
         let sample = AVSpeechUtterance(string: voice.recognitionLanguage == "ta" ? "வணக்கம்! நான் ஜெஸ்ஸி. உங்களுக்கு எப்படி உதவலாம்?" : "Hello! I’m Jessy. How can I help you?")
         configureVoice(sample); speaker.speak(sample)
@@ -50,14 +169,163 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
         speaker.speak(utterance)
     }
     func resumeHandsFree() {
-        guard ready, !busy, !recording, !locked, !speaker.isSpeaking else { return }
+        guard ready, !busy, !recording, !locked, !speaker.isSpeaking, !cloudVoiceActive else { return }
         voice.resume()
     }
+    func speakWithCloudVoice(_ reply: String) {
+        let voiceID = cloudVoiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = cloudVoiceKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, voiceID.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil else {
+            status = "Enter an ElevenLabs voice ID and API key in Voice settings."
+            return
+        }
+        guard let url = URL(string: "https://api.elevenlabs.io/v1/text-to-speech/\(voiceID)?output_format=mp3_44100_128") else { return }
+        let text = String(reply.prefix(5000))
+        approve("Send up to 5,000 characters of this reply to ElevenLabs for audio?") {
+            speaker.stopSpeaking(at: .immediate)
+            voice.suspend()
+            cloudVoiceActive = true
+            status = "Requesting ElevenLabs audio…"
+            cloudVoiceTask = Task { @MainActor in
+                let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
+                defer { session.finishTasksAndInvalidate() }
+                do {
+                    var request = URLRequest(url: url, timeoutInterval: 25)
+                    request.httpMethod = "POST"
+                    request.setValue(key, forHTTPHeaderField: "xi-api-key")
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = try JSONEncoder().encode(["text": text, "model_id": "eleven_multilingual_v2"])
+                    let (audio, response) = try await session.data(for: request)
+                    try Task.checkCancellation()
+                    let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    guard code == 200 else {
+                        stopCloudVoice()
+                        status = "ElevenLabs returned HTTP \(code). Check your key, voice ID, and plan."
+                        resumeHandsFree()
+                        return
+                    }
+                    let player = try AVAudioPlayer(data: audio)
+                    player.delegate = self
+                    cloudPlayer = player
+                    guard player.play() else { throw CocoaError(.fileReadCorruptFile) }
+                    status = "Playing ElevenLabs audio…"
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    stopCloudVoice()
+                    status = "Could not play ElevenLabs audio."
+                    resumeHandsFree()
+                }
+            }
+        }
+    }
+    func stopCloudVoice() {
+        cloudVoiceTask?.cancel()
+        cloudVoiceTask = nil
+        cloudPlayer?.stop()
+        cloudPlayer = nil
+        cloudVoiceActive = false
+    }
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.cloudPlayer === player else { return }
+            self.stopCloudVoice()
+            self.status = flag ? "Offline · \(self.modelName)" : "ElevenLabs playback ended early."
+            self.resumeHandsFree()
+        }
+    }
+    private func axValue(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+        var value: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success ? value : nil
+    }
+    private func focusedWindow(pid: pid_t) -> AXUIElement? {
+        let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, 0.25)
+        guard let value = axValue(application, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+    private func controlLabel(_ element: AXUIElement) -> String? {
+        guard (axValue(element, kAXEnabledAttribute) as? Bool) != false else { return nil }
+        let role = axValue(element, kAXRoleAttribute) as? String
+        guard [kAXButtonRole, "AXLink", kAXRadioButtonRole, kAXPopUpButtonRole].contains(role ?? "") else { return nil }
+        var actions: CFArray?
+        guard AXUIElementCopyActionNames(element, &actions) == .success,
+              (actions as? [String])?.contains(kAXPressAction) == true else { return nil }
+        let title = (axValue(element, kAXTitleAttribute) as? String) ?? (axValue(element, kAXDescriptionAttribute) as? String) ?? ""
+        let label = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
+        return label.isEmpty ? nil : label
+    }
+    private func windowControls(_ window: AXUIElement) -> [(AXUIElement, String)] {
+        var queue = [window]
+        var controls: [(AXUIElement, String)] = []
+        var index = 0
+        let deadline = ProcessInfo.processInfo.systemUptime + 1.5
+        while index < queue.count && index < 180 && controls.count < 35 && ProcessInfo.processInfo.systemUptime < deadline {
+            let element = queue[index]
+            index += 1
+            if let label = controlLabel(element) { controls.append((element, label)) }
+            var children: CFArray?
+            if AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, 40, &children) == .success,
+               let children = children as? [AXUIElement] {
+                queue.append(contentsOf: children)
+            }
+        }
+        return controls
+    }
+    func findScreenControl(pid: pid_t, goal: String) {
+        guard ready, !busy, !locked, !goal.isEmpty else { return }
+        guard goal.count <= 500 else { status = "Use at most 500 characters for the action."; return }
+        stopCloudVoice()
+        let promptOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        guard AXIsProcessTrustedWithOptions(promptOptions) else {
+            status = "Allow Jesshi in macOS Privacy & Security → Accessibility, then try again."
+            return
+        }
+        guard let app = NSRunningApplication(processIdentifier: pid), let window = focusedWindow(pid: pid) else {
+            status = "No accessible focused window found. Open a window in the selected app."
+            return
+        }
+        let controls = windowControls(window)
+        guard !controls.isEmpty else { status = "No supported controls found in that window."; return }
+        voice.suspend()
+        pendingNavigation = (app, window, controls)
+        busy = true
+        status = "Finding a control locally…"
+        send(["type": "navigate", "goal": goal, "controls": controls.map { $0.1 }])
+    }
+    private func finishNavigation(index: Int) {
+        defer { pendingNavigation = nil; busy = false; resumeHandsFree() }
+        guard let navigation = pendingNavigation, navigation.controls.indices.contains(index) else {
+            status = "No matching control found."
+            return
+        }
+        let (element, label) = navigation.controls[index]
+        let app = navigation.app
+        status = "Control ready for review."
+        approve("Press “\(label)” in \(app.localizedName ?? "the selected app")?") {
+            guard !app.isTerminated, let window = focusedWindow(pid: app.processIdentifier),
+                  CFEqual(window, navigation.window), controlLabel(element) == label,
+                  windowControls(window).contains(where: { CFEqual($0.0, element) }) else {
+                status = "The window or control changed. Find the control again."
+                return
+            }
+            let result = AXUIElementPerformAction(element, kAXPressAction as CFString)
+            status = result == .success ? "Pressed “\(label)”." : "The app did not accept the action."
+        }
+        if status == "Control ready for review." { status = "Screen action cancelled." }
+    }
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async { [weak self] in self?.speaking = self?.speaker.isSpeaking == true }
+    }
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async { [weak self] in self?.speaking = self?.speaker.isSpeaking == true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.resumeHandsFree() }
     }
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async { [weak self] in self?.resumeHandsFree() }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.speaking = self.speaker.isSpeaking
+            self.resumeHandsFree()
+        }
     }
     var launchAtLogin: Bool { SMAppService.mainApp.status == .enabled }
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -179,9 +447,7 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
                 if url.pathExtension.lowercased() == "pdf", let pdf = PDFDocument(url: url) {
                     for i in 0..<min(pdf.pageCount, 100) { text += "[Page \(i + 1)]\n" + (pdf.page(at: i)?.string ?? "") + "\n" }
                 } else if ["png", "jpg", "jpeg"].contains(url.pathExtension.lowercased()) {
-                    let request = VNRecognizeTextRequest(); request.recognitionLevel = .accurate
-                    try VNImageRequestHandler(url: url).perform([request])
-                    text = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+                    text = try Self.recognizedText(in: VNImageRequestHandler(url: url))
                 } else { text = try String(contentsOf: url, encoding: .utf8) }
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw CocoaError(.fileReadCorruptFile) }
                 let extracted = String(text.prefix(120_000))
@@ -193,11 +459,54 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
             } catch { DispatchQueue.main.async { self.status = "Import failed: \(error.localizedDescription)" } }
         }
     }
+    func importClipboardScreenshot() {
+        guard !locked else { return }
+        let clipboard = NSPasteboard.general
+        guard let image = clipboard.data(forType: .png) ?? clipboard.data(forType: .tiff) else {
+            status = "Copy a screenshot to the clipboard first."
+            return
+        }
+        guard image.count <= 20_000_000 else { status = "Choose an image under 20 MB."; return }
+        status = "Reading screenshot locally…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let text = try Self.recognizedText(in: VNImageRequestHandler(data: image))
+                DispatchQueue.main.async {
+                    guard !self.locked else { return }
+                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        self.status = "No readable text found in the screenshot."
+                        return
+                    }
+                    let document = SavedDocument(name: "Clipboard screenshot · \(Date().formatted())", text: String(text.prefix(120_000)))
+                    self.checkpoint()
+                    self.library.documents.append(document)
+                    self.library.selectedDocument = document.id
+                    self.audit("Imported clipboard screenshot")
+                    self.status = "Screenshot selected. Ask about its text in Chat."
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard !self.locked else { return }
+                    self.status = "Could not read screenshot: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+    private static func recognizedText(in handler: VNImageRequestHandler) throws -> String {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        try handler.perform([request])
+        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+    }
     @Published var input = ""
     @Published var status = "Starting bundled offline model…"
     @Published var busy = true
     @Published var ready = false
+    @Published var planFirst = UserDefaults.standard.bool(forKey: "jessy.planFirst") {
+        didSet { UserDefaults.standard.set(planFirst, forKey: "jessy.planFirst") }
+    }
     @Published var recording = false
+    @Published private(set) var speaking = false
     @Published var speak = true
     private var worker: Process?
     private var writer: FileHandle?
@@ -213,7 +522,7 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
         speaker.delegate = self
         voice.canListen = { [weak self] in
             guard let self else { return false }
-            return self.sessionAvailable && self.ready && !self.busy && !self.locked && !self.recording && !self.speaker.isSpeaking
+            return self.sessionAvailable && self.ready && !self.busy && !self.locked && !self.recording && !self.speaker.isSpeaking && !self.cloudVoiceActive
         }
         voice.onWake = { [weak self] in
             guard let self else { return }
@@ -294,11 +603,14 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
                 alert.addButton(withTitle: "Cancel")
                 send(["type": "confirm", "approved": alert.runModal() == .alertFirstButtonReturn])
             case "answer_start": liveReply = ""
+            case "phase": status = text
+            case "navigation": finishNavigation(index: obj["index"] as? Int ?? -1)
             case "delta": liveReply += text
             case "speech": say(text)
             case "timing":
                 latency = "First text: \(obj["first_token_ms"] as? Int ?? 0) ms · Full reply: \(obj["total_ms"] as? Int ?? 0) ms"
             case "answer":
+                status = "Offline · \(modelName)"
                 lines.append(ChatLine(role: "Jessy", text: text)); persist()
                 busy = false
                 liveReply = ""
@@ -311,6 +623,8 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
             case "reset":
                 lines.removeAll(); persist(); busy = false
             case "error":
+                if pendingNavigation != nil { status = "Could not find a screen control: \(text)" }
+                pendingNavigation = nil
                 lines.append(ChatLine(role: "Error", text: text)); busy = false; liveReply = ""; resumeHandsFree()
             default: break
             }
@@ -327,6 +641,7 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
         }
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard ready, !busy, !locked, !text.isEmpty else { return }
+        stopCloudVoice()
         voice.suspend(); busy = true; speaker.stopSpeaking(at: .immediate)
         input = ""; liveReply = ""
         lines.append(ChatLine(role: "You", text: text))
@@ -336,13 +651,16 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
               "context": retrievedExcerpt(document?.text ?? "", query: text),
               "source": document?.name ?? "", "language": voice.enabled ? "Auto" : library.language,
               "low_power": library.lowPower || ProcessInfo.processInfo.isLowPowerModeEnabled,
+              "plan_first": planFirst,
               "allowed": library.allowedTools])
     }
     func reset() {
+        stopCloudVoice()
         voice.suspend(); busy = true; speaker.stopSpeaking(at: .immediate); send(["type": "reset"])
     }
     func toggleRecording() {
         if recording { stopRecording(); return }
+        stopCloudVoice()
         voice.suspend(); speaker.stopSpeaking(at: .immediate)
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] allowed in
             DispatchQueue.main.async {
@@ -374,6 +692,9 @@ final class Agent: NSObject, ObservableObject, AVAudioRecorderDelegate, AVSpeech
         recordingURL = nil
     }
     func shutdown() {
+        pendingNavigation = nil
+        stopCloudVoice()
+        cloudVoiceKey = ""
         voice.shutdown()
         recordingTimer?.invalidate(); recorder?.stop(); speaker.stopSpeaking(at: .immediate)
         reader?.readabilityHandler = nil
@@ -460,6 +781,11 @@ struct ContentView: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(line.role).font(.caption.bold()).foregroundColor(.secondary)
                                 Text(line.text).font(.system(size: agent.library.fontSize ?? 16)).textSelection(.enabled)
+                                if line.role == "Jessy", !agent.cloudVoiceID.isEmpty {
+                                    Button("Play with ElevenLabs", systemImage: "speaker.wave.2") {
+                                        agent.speakWithCloudVoice(line.text)
+                                    }.disabled(agent.busy || agent.recording || agent.cloudVoiceActive)
+                                }
                             }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
                                 .background(line.role == "You" ? Color.accentColor.opacity(0.10) : Color.secondary.opacity(0.07))
                                 .cornerRadius(12).id(line.id)
@@ -476,7 +802,18 @@ struct ContentView: View {
                     if !text.isEmpty { proxy.scrollTo("live-reply", anchor: .bottom) }
                 }
             }
-            if agent.busy { HStack { ProgressView().controlSize(.small); Text(agent.ready ? "Working locally…" : "Starting…").foregroundColor(.secondary); Spacer() } }
+            if agent.recording || agent.speaking || agent.busy {
+                HStack {
+                    if agent.recording { Label("Listening…", systemImage: "mic.fill") }
+                    else if agent.speaking { Label("Speaking…", systemImage: "speaker.wave.2.fill") }
+                    else {
+                        ProgressView().controlSize(.small)
+                        Text(agent.ready ? "Working locally…" : "Starting…")
+                    }
+                    Spacer()
+                }
+                .foregroundStyle(.secondary)
+            }
             HStack {
                 TextField("Type a message…", text: $agent.input).textFieldStyle(.roundedBorder)
                     .onSubmit { if !agent.busy && !agent.recording { agent.submit() } }
@@ -576,6 +913,7 @@ struct LibraryView: View {
                     Text("Import a PDF, UTF-8 text file, or screenshot. Extraction happens on this Mac. Scanned PDFs need text extraction elsewhere.")
                     HStack {
                         Button("Import document or screenshot") { agent.importDocument() }
+                        Button("Paste screenshot") { agent.importClipboardScreenshot() }
                         Button("Use general chat") { agent.library.selectedDocument = nil; agent.persist() }
                     }
                     TextField("Search document names and contents", text: $search)
@@ -626,6 +964,13 @@ struct LibraryView: View {
                     Button("Add calendar event from task field") { agent.approve("Create a one-hour event: \(task), \(due.formatted())?") { services.addEvent(task, date: due) } }.disabled(task.isEmpty)
                     Text(services.status).font(.caption).textSelection(.enabled)
                 }.padding().tabItem { Label("Memory & Tasks", systemImage: "checklist") }
+                ScrollView {
+                    CalendarBriefingView(services: services)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                }.tabItem { Label("Briefing", systemImage: "calendar") }
+                MailBriefingView().tabItem { Label("Inbox", systemImage: "envelope") }
+                ScreenNavigationView(agent: agent).tabItem { Label("Screen", systemImage: "cursorarrow") }
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Tool permissions").font(.headline)
                     ForEach(tools, id: \.0) { tool in
@@ -662,6 +1007,11 @@ struct LibraryView: View {
                     Text("Choose a woman or man voice above. Child-like style raises pitch; it is not a separately trained boy/girl voice.").font(.caption)
                     Slider(value: $agent.voiceRate, in: 0.35...0.65) { Text("Speaking speed") }
                     Button("Preview selected voice") { agent.previewVoice() }
+                    Divider()
+                    Text("ElevenLabs voice").font(.headline)
+                    TextField("Voice ID", text: $agent.cloudVoiceID)
+                    SecureField("API key for this session", text: $agent.cloudVoiceKey)
+                    Text("Play a selected chat reply through ElevenLabs. Jesshi asks before sending reply text. Your API key stays in memory until you lock or quit.").font(.caption)
                     Link("Download more Apple voices", destination: URL(string: "https://support.apple.com/guide/mac-help/mchlp2290/mac")!)
                     Text("New Apple voices appear after downloading them in macOS Accessibility → Read & Speak / Spoken Content. They work offline after download.").font(.caption)
                 }.padding() }.tabItem { Label("Voice & Tamil", systemImage: "waveform") }
@@ -679,6 +1029,9 @@ struct LibraryView: View {
                     Text("Mac memory: \(ProcessInfo.processInfo.physicalMemory / 1_073_741_824) GB. Bundled model selection respects a memory budget. Select another installed model below; import additional weights through the local model store described in README.")
                     Picker("Installed model", selection: $chosenModel) { ForEach(agent.availableModels, id: \.self) { Text($0).tag($0) } }
                     Button("Switch installed model") { agent.busy = true; agent.send(["type": "select_model", "model": chosenModel]) }.disabled(chosenModel.isEmpty || agent.busy)
+                    Toggle("Plan with a second local model", isOn: $agent.planFirst)
+                        .disabled(agent.availableModels.count < 2)
+                    Text("Uses another installed model to outline an approach before answering. This adds time to each reply.").font(.caption)
                     Toggle("Low-power inference (shorter answers, two CPU threads)", isOn: $agent.library.lowPower)
                     Text("Mac Low Power Mode also enables these limits. Generation pauses during serious or critical thermal pressure.").font(.caption)
                     TextField("Reply language (Auto follows your language)", text: $agent.library.language)
@@ -687,7 +1040,7 @@ struct LibraryView: View {
                     Text("Offline: chat, microphone transcription, installed system voice, document reading, memory, tasks, and supported Mac controls.")
                     Slider(value: Binding(get: { agent.library.fontSize ?? 16 }, set: { agent.library.fontSize = $0 }), in: 14...24, step: 1) { Text("Text size") }
                     Text("Text size: \(Int(agent.library.fontSize ?? 16)) pt. Keyboard navigation and selectable text are available.").font(.caption)
-                    Text("Native iPhone and website use their own local models. Transfer encrypted backups to sync manually. Cloud actions and unrestricted device control are unavailable.").foregroundColor(.secondary)
+                    Text("iPhone and web use their own local models. Use encrypted backups to transfer data between devices.").foregroundColor(.secondary)
                     Spacer()
                 }.padding() }.tabItem { Label("Model & Offline", systemImage: "cpu") }
                 VStack(alignment: .leading, spacing: 10) {

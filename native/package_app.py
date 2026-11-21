@@ -39,20 +39,25 @@ if __name__ == '__main__':
         elif source.is_dir() and source.name.startswith('mlx_metal'):
             shutil.copytree(source, runtime_target / source.name, dirs_exist_ok=True)
     # Copy real files, not symlinks to the user's model store.
-    manifest_path = Path('manifests/registry.ollama.ai/library/qwen3/8b')
-    manifest = json.loads((MODEL_ROOT / manifest_path).read_text())
-    copy(MODEL_ROOT / manifest_path, RES / 'models' / manifest_path)
-    for layer in [manifest['config'], *manifest['layers']]:
-        blob = layer['digest'].replace(':', '-')
-        target = RES / 'models/blobs' / blob
-        if not target.exists() or target.stat().st_size != layer['size']:
-            copy(MODEL_ROOT / 'blobs' / blob, target)
+    for model in ('qwen3/8b', 'llama3.2/latest'):
+        manifest_path = Path('manifests/registry.ollama.ai/library') / model
+        source = MODEL_ROOT / manifest_path
+        if model != 'qwen3/8b' and not source.is_file():
+            continue
+        manifest = json.loads(source.read_text())
+        for layer in [manifest['config'], *manifest['layers']]:
+            blob = layer['digest'].replace(':', '-')
+            target = RES / 'models/blobs' / blob
+            if not target.exists() or target.stat().st_size != layer['size']:
+                copy(MODEL_ROOT / 'blobs' / blob, target)
+        copy(source, RES / 'models' / manifest_path)
     info = dict(CFBundleName='Jessy', CFBundleDisplayName='Jessy',
                 CFBundleIdentifier='local.offline.assistant.standalone',
                 CFBundleExecutable='OfflineAssistant', CFBundlePackageType='APPL',
                 CFBundleShortVersionString='1.4', CFBundleVersion='6',
                 LSMinimumSystemVersion='14.0', NSHighResolutionCapable=True,
                 NSCalendarsWriteOnlyAccessUsageDescription='Create calendar events after you approve them.',
+                NSCalendarsFullAccessUsageDescription='Read your calendar to show a briefing when you ask.',
                 NSRemindersFullAccessUsageDescription='Add tasks to Apple Reminders when you request it.',
                 NSLocalNetworkUsageDescription='Connect to your configured local Home Assistant server.',
                 NSAppTransportSecurity={'NSAllowsLocalNetworking': True, 'NSAllowsArbitraryLoads': True},

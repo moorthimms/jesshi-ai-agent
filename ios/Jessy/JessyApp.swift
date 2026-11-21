@@ -245,6 +245,9 @@ struct JessyView: View {
     var tasks: some View {
         NavigationStack {
             List {
+                Section("Calendar briefing") {
+                    CalendarBriefingView(services: services)
+                }
                 Section("New task or event") {
                     TextField("Title", text: $taskTitle); DatePicker("Time", selection: $taskDate)
                     Button("Add task") { store.checkpoint(); store.state.tasks.append(PortableTask(id: UUID().uuidString, title: taskTitle, done: false, due: taskDate.timeIntervalSince1970 * 1000)); store.save(); taskTitle = "" }.disabled(taskTitle.isEmpty)

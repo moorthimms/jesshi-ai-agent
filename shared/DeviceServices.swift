@@ -2,6 +2,56 @@ import Foundation
 import EventKit
 import UserNotifications
 import Security
+import SwiftUI
+
+struct CalendarBriefingView: View {
+    @State private var days = 1
+    @State private var entries: [EKEvent] = []
+    @State private var message = ""
+    @State private var loading = false
+    let services: DeviceServices
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("Date range", selection: $days) {
+                Text("Today").tag(1)
+                Text("Next 7 days").tag(7)
+            }
+            .pickerStyle(.segmented)
+            .disabled(loading)
+            .onChange(of: days) { _, _ in
+                entries = []
+                message = ""
+            }
+            Button("Load calendar briefing", systemImage: "calendar") { load() }
+                .disabled(loading)
+            if loading { ProgressView("Reading calendar…") }
+            if !message.isEmpty { Text(message).foregroundStyle(.secondary) }
+            ForEach(Array(entries.enumerated()), id: \.offset) { _, event in
+                VStack(alignment: .leading) {
+                    Text(event.title ?? "Untitled event").font(.headline)
+                    Text(event.startDate.formatted(date: .abbreviated, time: event.isAllDay ? .omitted : .shortened))
+                    if event.isAllDay { Text("All day").font(.caption) }
+                }
+            }
+        }
+    }
+
+    private func load() {
+        loading = true
+        entries = []
+        message = ""
+        Task { @MainActor in
+            defer { loading = false }
+            do {
+                entries = try await services.calendarBriefing(days: days)
+                if entries.isEmpty { message = "No events in this date range." }
+            } catch {
+                message = error.localizedDescription
+            }
+        }
+    }
+}
 
 final class DeviceServices: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     @Published var status = ""
@@ -23,6 +73,19 @@ final class DeviceServices: NSObject, ObservableObject, UNUserNotificationCenter
         }
     }
     func cancel(id: String) { UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [id]) }
+    @MainActor
+    func calendarBriefing(days: Int) async throws -> [EKEvent] {
+        guard try await events.requestFullAccessToEvents() else {
+            throw NSError(domain: "Jessy.Calendar", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Allow full calendar access in Settings to view your briefing."
+            ])
+        }
+        let calendar = Calendar.current
+        let start = calendar.startOfDay(for: Date())
+        guard let end = calendar.date(byAdding: .day, value: days, to: start) else { return [] }
+        let predicate = events.predicateForEvents(withStart: start, end: end, calendars: nil)
+        return events.events(matching: predicate).sorted { $0.startDate < $1.startDate }
+    }
     func addReminder(_ title: String, date: Date?) {
         events.requestFullAccessToReminders { allowed, error in
             guard allowed else { self.report(error?.localizedDescription ?? "Reminders access denied."); return }
